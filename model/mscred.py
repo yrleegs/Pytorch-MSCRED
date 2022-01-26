@@ -2,19 +2,28 @@ import torch
 import torch.nn as nn
 import numpy as np
 from model.convolution_lstm import ConvLSTM
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def attention(ConvLstm_out):
-    attention_w = []
-    for k in range(5):
-        attention_w.append(torch.sum(torch.mul(ConvLstm_out[k], ConvLstm_out[-1]))/5)
-    m = nn.Softmax()
-    attention_w = torch.reshape(m(torch.stack(attention_w)), (-1, 5))
-    cl_out_shape = ConvLstm_out.shape
-    ConvLstm_out = torch.reshape(ConvLstm_out, (5, -1))
-    convLstmOut = torch.matmul(attention_w, ConvLstm_out)
-    convLstmOut = torch.reshape(convLstmOut, (cl_out_shape[1], cl_out_shape[2], cl_out_shape[3]))
-    return convLstmOut
+def attention(out):
+    t_out = out.transpose(0, 1)
+    s, b, _, _ ,_ = t_out.shape
+    
+    att = []
+
+    for k in range(s):
+        inner = torch.mul(t_out[k], t_out[-1]).reshape(b, -1)
+        inner = inner.sum(1) / s
+        att.append(inner)
+
+    att = torch.softmax(torch.stack(att).T, 1)
+
+    b, s, c, w, h = out.shape
+
+    att = att.reshape(b, s, 1)
+    out = out.reshape(b, s, -1)
+
+    out = (out * att).sum(1).reshape(b, c, w, h)
+    
+    return out
 
 class CnnEncoder(nn.Module):
     def __init__(self, in_channels_encoder):
@@ -35,11 +44,25 @@ class CnnEncoder(nn.Module):
             nn.Conv2d(128, 256, 2, (2, 2), 0),
             nn.SELU()
         )
+
+
     def forward(self, X):
+        b, s, c, w, h = X.shape
+        X = X.reshape(-1, c, w, h)
+
         conv1_out = self.conv1(X)
         conv2_out = self.conv2(conv1_out)
         conv3_out = self.conv3(conv2_out)
         conv4_out = self.conv4(conv3_out)
+
+        def reshape_out(x):
+            _, x_c, x_w, x_h = x.shape
+            return x.reshape(b, s, x_c, x_w, x_h)
+
+        conv1_out, conv2_out, conv3_out, conv4_out = map(
+            reshape_out, [conv1_out, conv2_out, conv3_out, conv4_out]
+        )
+
         return conv1_out, conv2_out, conv3_out, conv4_out
 
 
@@ -55,17 +78,16 @@ class Conv_LSTM(nn.Module):
         self.conv4_lstm = ConvLSTM(input_channels=256, hidden_channels=[256], 
                                    kernel_size=3, step=5, effective_step=[4])
 
-    def forward(self, conv1_out, conv2_out, 
-                conv3_out, conv4_out):
-        conv1_lstm_out = self.conv1_lstm(conv1_out)
-        conv1_lstm_out = attention(conv1_lstm_out[0][0])
-        conv2_lstm_out = self.conv2_lstm(conv2_out)
-        conv2_lstm_out = attention(conv2_lstm_out[0][0])
-        conv3_lstm_out = self.conv3_lstm(conv3_out)
-        conv3_lstm_out = attention(conv3_lstm_out[0][0])
-        conv4_lstm_out = self.conv4_lstm(conv4_out)
-        conv4_lstm_out = attention(conv4_lstm_out[0][0])
-        return conv1_lstm_out.unsqueeze(0), conv2_lstm_out.unsqueeze(0), conv3_lstm_out.unsqueeze(0), conv4_lstm_out.unsqueeze(0)
+    def forward(self, out1, out2, out3, out4):
+        (l_out1,), _ = self.conv1_lstm(out1)
+        l_out1 = attention(l_out1)
+        (l_out2,), _ = self.conv2_lstm(out2)
+        l_out2 = attention(l_out2)
+        (l_out3,), _ = self.conv3_lstm(out3)
+        l_out3 = attention(l_out3)
+        (l_out4,), _ = self.conv4_lstm(out4)
+        l_out4 = attention(l_out4)
+        return l_out1, l_out2, l_out3, l_out4
 
 class CnnDecoder(nn.Module):
     def __init__(self, in_channels):
@@ -87,13 +109,13 @@ class CnnDecoder(nn.Module):
             nn.SELU()
         )
     
-    def forward(self, conv1_lstm_out, conv2_lstm_out, conv3_lstm_out, conv4_lstm_out):
-        deconv4 = self.deconv4(conv4_lstm_out)
-        deconv4_concat = torch.cat((deconv4, conv3_lstm_out), dim = 1)
+    def forward(self, out1, out2, out3, out4):
+        deconv4 = self.deconv4(out4)
+        deconv4_concat = torch.cat((deconv4, out3), dim = 1)
         deconv3 = self.deconv3(deconv4_concat)
-        deconv3_concat = torch.cat((deconv3, conv2_lstm_out), dim = 1)
+        deconv3_concat = torch.cat((deconv3, out2), dim = 1)
         deconv2 = self.deconv2(deconv3_concat)
-        deconv2_concat = torch.cat((deconv2, conv1_lstm_out), dim = 1)
+        deconv2_concat = torch.cat((deconv2, out1), dim = 1)
         deconv1 = self.deconv1(deconv2_concat)
         return deconv1
 
@@ -106,12 +128,7 @@ class MSCRED(nn.Module):
         self.cnn_decoder = CnnDecoder(in_channels_decoder)
     
     def forward(self, x):
-        conv1_out, conv2_out, conv3_out, conv4_out = self.cnn_encoder(x)
-        conv1_lstm_out, conv2_lstm_out, conv3_lstm_out, conv4_lstm_out = self.conv_lstm(
-                                conv1_out, conv2_out, conv3_out, conv4_out)
-
-        gen_x = self.cnn_decoder(conv1_lstm_out, conv2_lstm_out, 
-                                conv3_lstm_out, conv4_lstm_out)
-        return gen_x
-
-
+        encoding = self.cnn_encoder(x)
+        lstm_encoding = self.conv_lstm(*encoding)
+        decoding = self.cnn_decoder(*lstm_encoding)
+        return decoding
